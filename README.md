@@ -625,7 +625,6 @@ models:
       timeout_s: 20
       batch_size: 32                           # with retries + backoff (see below)
     rerank:
-      backend: typesafe                        # typesafe (Jev System One) | nvidia (Cohere-shape)
       url: https://openrouter.ai/api/v1/rerank
       model: nvidia/llama-nemotron-rerank-vl-1b-v2:free
       key_env: RERANK_API_KEY
@@ -634,7 +633,27 @@ models:
 ```
 
 Keys are read from the named environment variable at call time; none is ever written to
-`index.yml`. `qmd status` reports which backend each role resolved to.
+`index.yml`. `qmd status` reports which backend each role resolved to:
+
+```
+Models
+  Embedding:   https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF (remote: nvidia/nemotron-3-embed-1b)
+  Reranking:   https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF (remote: nvidia/llama-nemotron-rerank-vl-1b-v2:free)
+  Generation:  https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf (local)
+```
+
+Both roles speak the OpenAI/Cohere wire shapes already common elsewhere - `POST` JSON with
+`Authorization: Bearer $KEY`, embeddings answered as `{data:[{embedding, index}]}` and rerank
+as `{results:[{index, relevance_score}]}` - so NVIDIA, OpenRouter and compatible endpoints
+work without a provider switch. Embeddings are matched back to their input by the returned
+`index`, and a response that is short, ragged or empty is an **error rather than a partial
+success**: a vector attached to the wrong chunk is worse than a missing one.
+
+**Remote endpoints are trust-gated.** A project-local `.qmd/index.yml` arrives with a
+`git clone`, and a `remote:` block inside one would ship every indexed document to a host
+chosen by whoever wrote the repository. Like the custom model URIs, a remote block from an
+untrusted project config is ignored (#889); it applies from the user-level config, or after
+`qmd trust`.
 
 ### Fallback policy: drop the neural layers, never substitute local ones
 
@@ -672,13 +691,31 @@ format enforcement in the prompt.
 It is also the source of the last latency tail: `expandQuery` passes `maxTokens: 600` and the
 grammar permits unbounded `line+`, so the model sometimes rambles to the cap (measured:
 ~14 expansions and ~25s versus 3.5 expansions and ~3.3s). This fork caps expansion at ~150
-tokens, bounding the worst case to ~6s.
+tokens (`QMD_EXPAND_MAX_TOKENS` overrides it), bounding the worst case to ~6s.
 
 ### Considered and rejected: a local fallback for embeddings
 
 Storing two vector spaces in parallel (768-d local + 2048-d cloud) was rejected: it doubles
 index-time embedding, adds ~6MB per 737 chunks, and needs a schema change — all to enable a
 fallback *slower than the outage it exists to cover*.
+
+### Verified
+
+Measured on the reference box against live endpoints, not fixtures:
+
+- **Cloud embeddings really ran.** After `qmd embed` the index schema reads
+  `embedding float[2048]`, the cloud model's width; the local model is 768-d, so a silent
+  local fallback cannot produce that table.
+- **Cloud re-ranking discriminates.** For "which port does the mcp gateway use", the correct
+  document scored 92% against 38% for an unrelated one.
+- **A dead endpoint degrades instead of stalling.** With the rerank URL unreachable the run
+  logged `skipping re-ranking; fusion order stands` and still returned results; with the
+  embed URL unreachable the new chunk *stayed pending* (`Pending: 1 need embedding`) rather
+  than being written with local vectors, and the command returned in seconds instead of
+  loading a local model.
+- 25 unit tests cover result ordering, dimension and completeness checks, retry
+  classification (429 retried; 401 and 404 not), missing keys, and the snake_case/camelCase
+  config spellings.
 
 ## Installation
 

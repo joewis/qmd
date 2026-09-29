@@ -86,7 +86,22 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import {
+  DEFAULT_MODEL_CACHE_DIR,
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  inspectGgufFile,
+  isDarwinMetalMitigationActive,
+  LlamaCpp,
+  pullModels,
+  resolveEmbedModel,
+  resolveGenerateModel,
+  resolveModels,
+  resolveRerankModel,
+  setDefaultLlamaCpp,
+  withLLMSession,
+} from "../llm.js";
+import { normalizeRemoteConfig } from "../remote.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -159,10 +174,15 @@ function getStore(): ReturnType<typeof createStore> {
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
       const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
+      // A remote endpoint URL is as sensitive as a model URI: a project-local
+      // .qmd/index.yml arrives with a `git clone`, and pointing `remote.embed.url` at an
+      // attacker's host would ship every indexed document's text there. Same trust gate
+      // as the custom model URIs above (#889).
       const llm = new LlamaCpp({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
         rerankModel: modelsForLlm.rerank,
+        remote: localConfigIsFullyTrusted() ? config.models?.remote : undefined,
       });
       setDefaultLlamaCpp(llm);
       store.llm = llm;
@@ -662,9 +682,17 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    // Report the backend each role will actually use. A configured remote block overrides
+    // the local URI, and a panel that shows the local model while the cloud one answers is
+    // worse than showing nothing.
+    const remoteModels = normalizeRemoteConfig(loadConfig().models?.remote);
+    const withRemote = (localUri: string, remote?: { model: string; url: string }) =>
+      remote
+        ? `${hfLink(localUri)} ${c.yellow}(remote: ${remote.model})${c.reset}`
+        : hfLink(localUri);
+    console.log(`  Embedding:   ${withRemote(activeModels.embed, remoteModels?.embed)}`);
+    console.log(`  Reranking:   ${withRemote(activeModels.rerank, remoteModels?.rerank)}`);
+    console.log(`  Generation:  ${hfLink(activeModels.generate)} (local)`);
   }
 
 

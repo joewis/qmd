@@ -10,6 +10,15 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import {
+  RemoteUnavailableError,
+  hasRemoteEmbed,
+  hasRemoteRerank,
+  normalizeRemoteConfig,
+  remoteEmbed,
+  remoteRerank,
+  type RemoteConfig,
+} from "./remote.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -622,6 +631,14 @@ export type LlamaCppConfig = {
    * memory reclaim.
    */
   disposeModelsOnInactivity?: boolean;
+  /**
+   * Optional cloud backends for embeddings and re-ranking (README, "Cloud Models with
+   * Local Fallback"). When present, those two steps run over HTTP and are *skipped* -
+   * never substituted with the local model - if the endpoint is unavailable. Query
+   * expansion stays local: its output format is enforced by a GBNF grammar, which
+   * hosted APIs do not accept.
+   */
+  remote?: RemoteConfig;
 };
 
 /**
@@ -630,6 +647,19 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+
+/**
+ * Token cap for query expansion (override with QMD_EXPAND_MAX_TOKENS).
+ *
+ * The expansion grammar permits unbounded `line+`, so upstream's 600-token cap lets the
+ * model ramble to the limit instead of stopping after 3-5 lines. Measured: slow runs
+ * averaged ~14 expansions and ~25s against 3.5 expansions and ~3.3s for fast ones, on
+ * ~13% of runs. 150 bounds the worst case at ~6s and leaves the typical case untouched.
+ */
+const EXPAND_MAX_TOKENS = (() => {
+  const parsed = parseInt(process.env.QMD_EXPAND_MAX_TOKENS ?? "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 150;
+})();
 
 export type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
@@ -812,6 +842,7 @@ export class LlamaCpp implements LLM {
 
   private embedModelUri: string;
   private generateModelUri: string;
+  private remote: RemoteConfig | undefined;
   private rerankModelUri: string;
   private modelCacheDir: string;
   private expandContextSize: number;
@@ -844,6 +875,7 @@ export class LlamaCpp implements LLM {
     // See isDarwinMetalMitigationActive() for the runtime check exposed to
     // diagnostics. No constructor-time guard installation is needed.
 
+    this.remote = normalizeRemoteConfig(config.remote);
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
@@ -1446,6 +1478,21 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    if (hasRemoteEmbed(this.remote)) {
+      // Skip-not-substitute: an unreachable provider removes this layer rather than
+      // handing the work to the local model (see remote.ts for the measured why).
+      try {
+        const [vector] = await remoteEmbed([text], this.remote!.embed!);
+        return { embedding: vector!, model: this.remote!.embed!.model };
+      } catch (error) {
+        if (error instanceof RemoteUnavailableError) {
+          console.warn(`⚠ ${error.message} — skipping remote embedding for this call`);
+          return null;
+        }
+        throw error;
+      }
+    }
+
     try {
       const context = await this.ensureEmbedContext();
 
@@ -1477,6 +1524,22 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     if (texts.length === 0) return [];
+
+    if (hasRemoteEmbed(this.remote)) {
+      try {
+        const vectors = await remoteEmbed(texts, this.remote!.embed!);
+        return vectors.map((embedding) => ({ embedding, model: this.remote!.embed!.model }));
+      } catch (error) {
+        if (error instanceof RemoteUnavailableError) {
+          console.warn(`⚠ ${error.message} — skipping remote embedding for this batch`);
+          // nulls leave the chunks unembedded: still searchable by BM25, retried on the
+          // next `qmd embed`. Writing local vectors into a remote-dimensioned index would
+          // corrupt the vector space, so skipping is the only safe response.
+          return texts.map(() => null);
+        }
+        throw error;
+      }
+    }
 
     try {
       const contexts = await this.ensureEmbedContexts();
@@ -1645,7 +1708,7 @@ export class LlamaCpp implements LLM {
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
       const result = await session.prompt(prompt, {
         grammar,
-        maxTokens: 600,
+        maxTokens: EXPAND_MAX_TOKENS,
         temperature: 0.7,
         topK: 20,
         topP: 0.8,
@@ -1710,6 +1773,29 @@ export class LlamaCpp implements LLM {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
+
+    if (hasRemoteRerank(this.remote)) {
+      // Skip-not-substitute: a local cross-encoder fallback measures 52-57s for 30
+      // candidates, which is worse than the outage it would be covering.
+      try {
+        const results = await remoteRerank(
+          query,
+          documents.map((doc) => ({ file: doc.file, text: doc.text })),
+          this.remote!.rerank!,
+        );
+        return { results, model: this.remote!.rerank!.model };
+      } catch (error) {
+        if (error instanceof RemoteUnavailableError) {
+          console.warn(`⚠ ${error.message} — skipping re-ranking; fusion order stands`);
+          // Deliberately EMPTY rather than uniform scores. store.rerank() caches every
+          // score it is handed, so returning synthetic 0.5s would persist them and
+          // distort later queries; an empty set caches nothing and leaves the caller's
+          // RRF order intact.
+          return { results: [], model: "skipped" };
+        }
+        throw error;
+      }
+    }
 
     const contexts = await this.ensureRerankContexts();
     if (contexts.length === 0) {

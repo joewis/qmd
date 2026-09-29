@@ -385,6 +385,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
+    remote: config?.models?.remote,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });

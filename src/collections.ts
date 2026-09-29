@@ -8,6 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { qmdHomedir } from "./paths.js";
+import type { RemoteConfig } from "./remote.js";
 import YAML from "yaml";
 
 // ============================================================================
@@ -40,6 +41,12 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+  /**
+   * Optional cloud backends for embeddings and re-ranking (see README, "Cloud Models
+   * with Local Fallback"). Additive: the `embed`/`rerank` URIs above stay the local
+   * models, and removing this block restores fully-local behaviour exactly.
+   */
+  remote?: RemoteConfig;
 }
 
 /**
