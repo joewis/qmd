@@ -2161,16 +2161,34 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   }
 }
 
+/**
+ * The model *identity* used for vector fingerprints, pending-work checks, vector-search
+ * filtering and the embedding prompt format. It is not the local model file: when a
+ * trusted remote backend is serving the work, the remote model name is the correct
+ * identity. Reporting the local URI here instead would leave the previous model's vectors
+ * looking current after a switch to the cloud - the fingerprint would still match, so
+ * `qmd embed` would no-op while queries were embedded at the new width, and a 2048-d query
+ * would be compared against 768-d rows.
+ */
+function remoteModelIdentity(): { embed?: string; rerank?: string } {
+  if (!localConfigIsFullyTrusted()) return {};
+  const remote = normalizeRemoteConfig(loadConfig().models?.remote);
+  return { embed: remote?.embed?.model, rerank: remote?.rerank?.model };
+}
+
 export function resolveEmbedModelForCli(): string {
-  return ensureModelsConfiguredForCli().embed;
+  return remoteModelIdentity().embed ?? ensureModelsConfiguredForCli().embed;
 }
 
 export function resolveGenerateModelForCli(): string {
+  // Query expansion stays local by design: its output format is enforced by a GBNF grammar
+  // that hosted APIs do not accept, so this identity is always the local model.
   return ensureModelsConfiguredForCli().generate;
 }
 
 export function resolveRerankModelForCli(): string {
-  return ensureModelsConfiguredForCli().rerank;
+  // Part of the rerank cache key, so it must name the re-ranker that actually scored.
+  return remoteModelIdentity().rerank ?? ensureModelsConfiguredForCli().rerank;
 }
 
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
