@@ -886,7 +886,15 @@ export class LlamaCpp implements LLM {
   }
 
   get embedModelName(): string {
-    return this.embedModelUri;
+    // The *identity* of the embedding model, which is what qmd fingerprints rows with
+    // (content_vectors.model / embed_fingerprint) and what the "what still needs
+    // embedding" queries compare against. When a remote backend is serving embeddings it
+    // must be the remote model name, not the local URI it supersedes: otherwise a switch
+    // to the cloud model leaves the previous model's vectors in place, and since a vec0
+    // table has a fixed width the query side would compare 2048-d query vectors against
+    // 768-d index vectors. `embedModelUri` stays the local URI - that is what resolves
+    // model files and selects the prompt format.
+    return this.remote?.embed?.model ?? this.embedModelUri;
   }
 
   get generateModelName(): string {
@@ -894,7 +902,10 @@ export class LlamaCpp implements LLM {
   }
 
   get rerankModelName(): string {
-    return this.rerankModelUri;
+    // Same reasoning as embedModelName: this value is part of the rerank cache key, so
+    // leaving it pointing at the local URI would let scores produced by one re-ranker be
+    // served for the other.
+    return this.remote?.rerank?.model ?? this.rerankModelUri;
   }
 
   /**

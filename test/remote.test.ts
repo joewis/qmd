@@ -205,6 +205,37 @@ describe("failure classification", () => {
   });
 });
 
+describe("model identity follows the remote backend", () => {
+  const LOCAL = {
+    embedModel: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
+    rerankModel: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
+  };
+
+  it("reports the local URIs when no remote backend is configured", async () => {
+    const { LlamaCpp } = await import("../src/llm.js");
+    const llm = new LlamaCpp(LOCAL);
+    expect(llm.embedModelName).toBe(LOCAL.embedModel);
+    expect(llm.rerankModelName).toBe(LOCAL.rerankModel);
+  });
+
+  it("reports the REMOTE model names when the cloud backends are active", async () => {
+    // This identity is what qmd fingerprints vectors with (content_vectors.model) and what
+    // keys the rerank cache. If it kept reporting the local URI, a switch to the cloud model
+    // would leave the previous model's vectors in place - silently, because the fingerprint
+    // would still "match" - and a 2048-d query would be compared against 768-d rows.
+    const { LlamaCpp } = await import("../src/llm.js");
+    const llm = new LlamaCpp({
+      ...LOCAL,
+      remote: {
+        embed: { url: "https://x", model: "nvidia/nemotron-3-embed-1b", key_env: "K" },
+        rerank: { url: "https://x", model: "nvidia/llama-nemotron-rerank-vl-1b-v2:free", key_env: "K" },
+      },
+    });
+    expect(llm.embedModelName).toBe("nvidia/nemotron-3-embed-1b");
+    expect(llm.rerankModelName).toBe("nvidia/llama-nemotron-rerank-vl-1b-v2:free");
+  });
+});
+
 describe("remoteRerank", () => {
   it("maps scores back to files and sorts best-first", async () => {
     global.fetch = vi.fn(async () =>
