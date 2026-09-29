@@ -2197,6 +2197,19 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
 
 /** Models that may actually be loaded. Falls back to defaults/env when a
  *  project-local config's custom URIs are not trusted (#889). */
+/**
+ * The trusted embedding *identity* for the embed path.
+ *
+ * resolveModelsForRuntime() intentionally returns the local model set, but passing its
+ * `.embed` straight into vectorIndex() names the wrong model whenever a remote backend is
+ * doing the work: vectorIndex() uses that value as the fingerprint identity, so the run
+ * concludes there is nothing to embed while the index still holds the previous model's
+ * vectors.
+ */
+function resolveEmbedModelIdentityForRuntime(): string {
+  return remoteModelIdentity().embed ?? resolveModelsForRuntime().embed;
+}
+
 function resolveModelsForRuntime(): { embed: string; generate: string; rerank: string } {
   const configured = ensureModelsConfiguredForCli();
   if (localConfigIsFullyTrusted()) return configured;
@@ -4691,7 +4704,7 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
+        await vectorIndex(resolveEmbedModelIdentityForRuntime(), !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
