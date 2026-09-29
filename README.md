@@ -585,6 +585,101 @@ Supported model families:
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
 
+## Cloud Models with Local Fallback
+
+> **Status: spec.** Describes the intended behaviour of this fork (`joewis/qmd`); the remote
+> backends are not implemented in this tree yet. Defaults remain fully local.
+
+This fork can send the two steps that dominate query latency — **embeddings** and
+**re-ranking** — to any OpenAI-compatible HTTP endpoint, while **query expansion stays
+local**. Remote backends are opt-in.
+
+### Why: measured on the reference box (16-core CPU, no GPU)
+
+| Step | Model | Cost |
+|------|-------|------|
+| Query expansion | `qmd-query-expansion-1.7B` (local) | p50 **3.3s**; a 600-token cap lets it ramble to **25s** in ~13% of runs |
+| Query embedding | `embeddinggemma-300M` (local) | sub-second |
+| Re-ranking | `qwen3-reranker-0.6b` (local) | **52–57s** for 30 candidates (~1.8s/doc) |
+| BM25 only | — | **~0.15s** |
+
+A full local neural pipeline costs **60s+ per search**. That does not read as a slow search —
+it reads as a stall. Hence the fallback below is not a *slower path*, it is a **different kind
+of path**.
+
+### Configuration
+
+Remote backends are **additive**: the existing `models.*` keys keep meaning "the local
+model", and deleting the `remote:` block restores fully-local behaviour exactly.
+
+```yaml
+models:
+  embed:    hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf   # local
+  rerank:   hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+  remote:
+    embed:
+      url: https://integrate.api.nvidia.com/v1/embeddings
+      model: nvidia/nemotron-3-embed-1b        # 2048-dim
+      key_env: EMBEDDING_API_KEY               # NAME of the env var, never the key
+      timeout_s: 20
+      batch_size: 32                           # with retries + backoff (see below)
+    rerank:
+      backend: typesafe                        # typesafe (Jev System One) | nvidia (Cohere-shape)
+      url: https://openrouter.ai/api/v1/rerank
+      model: nvidia/llama-nemotron-rerank-vl-1b-v2:free
+      key_env: RERANK_API_KEY
+      top_n: 100
+      timeout_s: 30
+```
+
+Keys are read from the named environment variable at call time; none is ever written to
+`index.yml`. `qmd status` reports which backend each role resolved to.
+
+### Fallback policy: drop the neural layers, never substitute local ones
+
+On any remote failure the affected layer is **skipped**, not re-run locally:
+
+- **Re-ranking fails** → skip re-ranking; RRF fusion order stands. Falling back to the local
+  cross-encoder would turn a 0.15s search into a ~55s one — a fallback worse than no fallback.
+- **Embedding fails** → do not embed. Chunks stay pending (still searchable by BM25) and are
+  retried on the next `qmd embed`. Writing 768-d local vectors into a 2048-d index would
+  corrupt the vector space; qmd refuses dimension mixes, and it is right to.
+- **Expansion** is local, unaffected, and separately capped (see below).
+
+Triggers, each logged once per run with role and reason: connection/DNS failure, timeout,
+401/403 (key rotated), **404 (model retired)**, 429 (rate limited), 5xx, and
+malformed/short responses (result count ≠ input count).
+
+Net effect: a cloud outage degrades search **quality**, never **availability** or latency.
+BM25 + RRF still answers in ~0.15s.
+
+### Free-tier models are expected to disappear
+
+The default reranker above is an OpenRouter `:free` model. Free tiers get rate-limited and
+retired without notice — the same failure that removed `deepseek-v4-flash:cloud` from
+Ollama's cloud catalogue. Therefore: retries with exponential backoff on 429/5xx, a hard
+per-call timeout, and the skip-not-substitute rule above. A retired model (404) must never
+take search down.
+
+### Query expansion stays local
+
+Expansion is the one step where on-device generation earns its keep: the default model is
+fine-tuned for the `lex`/`vec`/`hyde` output format, and locally that format is enforced by a
+GBNF grammar — which hosted APIs do not accept. Keeping it local avoids re-implementing
+format enforcement in the prompt.
+
+It is also the source of the last latency tail: `expandQuery` passes `maxTokens: 600` and the
+grammar permits unbounded `line+`, so the model sometimes rambles to the cap (measured:
+~14 expansions and ~25s versus 3.5 expansions and ~3.3s). This fork caps expansion at ~150
+tokens, bounding the worst case to ~6s.
+
+### Considered and rejected: a local fallback for embeddings
+
+Storing two vector spaces in parallel (768-d local + 2048-d cloud) was rejected: it doubles
+index-time embedding, adds ~6MB per 737 chunks, and needs a schema change — all to enable a
+fallback *slower than the outage it exists to cover*.
+
 ## Installation
 
 ```sh
