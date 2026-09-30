@@ -16,6 +16,7 @@ import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
+import { getEmbeddingFingerprint } from "../src/store.ts";
 import { setConfigSource } from "../src/collections.ts";
 
 // Test fixtures directory and database path
@@ -1439,6 +1440,102 @@ describe("orphaned embedding vectors (#768)", () => {
     expect(vectors).toBe(4);
     expect(cache).toBe(2);
     expect(inactive).toBe(1);
+  });
+});
+
+describe("remote embed identity in health reporting", () => {
+  // Guards the phantom-backlog bug: on a remote-embedding index every content_vectors row
+  // is fingerprinted with the REMOTE model name, so any health query that compares those
+  // rows against the LOCAL embed URI reports the whole index as stale and tells the user to
+  // rebuild against a paid API. Measured live: `qmd update` printed
+  // "1225 unique hashes need vectors" directly above `qmd embed`'s
+  // "All content hashes already have embeddings", and `qmd doctor` said
+  // "0 docs current, 1248 docs legacy/stale" with a `--force` recommendation.
+  const REMOTE_MODEL = "nvidia/nemotron-3-embed-1b";
+  let remoteDbPath: string;
+  let remoteConfigDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("remote-embed-identity");
+    remoteDbPath = env.dbPath;
+    remoteConfigDir = env.configDir;
+
+    // A real local URI for the model-file side of doctor, plus a remote block. The remote
+    // URLs point at the discard port so any accidental network use fails fast and offline.
+    await writeFile(
+      join(remoteConfigDir, "index.yml"),
+      [
+        "collections: {}",
+        "models:",
+        `  embed: ${DEFAULT_EMBED_MODEL_URI}`,
+        `  generate: ${DEFAULT_GENERATE_MODEL_URI}`,
+        `  rerank: ${DEFAULT_RERANK_MODEL_URI}`,
+        "  remote:",
+        "    embed:",
+        "      url: http://127.0.0.1:9/v1/embeddings",
+        `      model: ${REMOTE_MODEL}`,
+        "      key_env: EMBEDDING_API_KEY",
+        "      timeout_s: 1",
+        "      batch_size: 32",
+        "    rerank:",
+        "      url: http://127.0.0.1:9/v1/rerank",
+        "      model: nvidia/llama-nemotron-rerank-vl-1b-v2:free",
+        "      key_env: OPENROUTER_API_KEY",
+        "      top_n: 100",
+        "",
+      ].join("\n"),
+    );
+
+    const add = await runQmd(["collection", "add", fixturesDir, "--name", "fixtures"], {
+      dbPath: remoteDbPath,
+      configDir: remoteConfigDir,
+    });
+    expect(add.exitCode).toBe(0);
+
+    // Index the fixtures so there are active documents to reason about.
+    const update = await runQmd(["update"], { dbPath: remoteDbPath, configDir: remoteConfigDir });
+    expect(update.exitCode).toBe(0);
+
+    // Seed one complete vector set per active hash, fingerprinted as the REMOTE model —
+    // exactly what a cloud-backed index looks like after a successful re-embed.
+    const db = openDatabase(remoteDbPath);
+    const fingerprint = getEmbeddingFingerprint(REMOTE_MODEL);
+    const hashes = db
+      .prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`)
+      .all() as { hash: string }[];
+    expect(hashes.length).toBeGreaterThan(0);
+    const now = new Date().toISOString();
+    for (const { hash } of hashes) {
+      db.prepare(`
+        INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+        VALUES (?, 0, 0, ?, ?, 1, ?)
+      `).run(hash, REMOTE_MODEL, fingerprint, now);
+    }
+    db.close();
+  });
+
+  test("update does not report a phantom embedding backlog", async () => {
+    const { stdout, exitCode } = await runQmd(["update"], {
+      dbPath: remoteDbPath,
+      configDir: remoteConfigDir,
+    });
+    expect(exitCode).toBe(0);
+    // The bug's signature: a pending count even though every hash has vectors.
+    expect(stdout).not.toContain("need vectors");
+    expect(stdout).not.toContain("unique hashes need vectors");
+  });
+
+  test("doctor judges the index current against the remote fingerprint", async () => {
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: remoteDbPath,
+      configDir: remoteConfigDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("all active documents match current fingerprint");
+    expect(stdout).toContain("docs on current fingerprint");
+    // The bug's signature: the stored rows judged stale.
+    expect(stdout).not.toContain("docs legacy/stale");
+    expect(stdout).not.toContain("active documents need embeddings");
   });
 });
 

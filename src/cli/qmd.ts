@@ -1019,8 +1019,13 @@ async function updateCollections(): Promise<void> {
     console.log("");
   }
 
-  // Check if any documents need embedding (show once at end)
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  // Check if any documents need embedding (show once at end).
+  // Pass the remote-aware identity explicitly: content_vectors rows are fingerprinted
+  // with the model that produced them, so the bare default (DEFAULT_EMBED_MODEL, a local
+  // URI) reports every document as pending on a cloud-backed index. That produced the
+  // permanent "N unique hashes need vectors" line that contradicts `qmd embed`'s
+  // "All content hashes already have embeddings" in the same cycle.
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
   const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
   const orphanedVectors = countOrphanedVectors(db);
   closeDb();
@@ -2065,8 +2070,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
 
-  // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  // Check if vector index needs updating (remote-aware identity — see the note on the
+  // other getHashesNeedingEmbedding call site above).
+  const needsEmbedding = getHashesNeedingEmbedding(db, undefined, resolveEmbedModelForCli());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -2171,9 +2177,20 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
  * would be compared against 768-d rows.
  */
 function remoteModelIdentity(): { embed?: string; rerank?: string } {
-  if (!localConfigIsFullyTrusted()) return {};
-  const remote = normalizeRemoteConfig(loadConfig().models?.remote);
-  return { embed: remote?.embed?.model, rerank: remote?.rerank?.model };
+  try {
+    if (!localConfigIsFullyTrusted()) return {};
+    const remote = normalizeRemoteConfig(loadConfig().models?.remote);
+    return { embed: remote?.embed?.model, rerank: remote?.rerank?.model };
+  } catch {
+    // An unreadable or invalid index.yml has no trustworthy remote identity, and the
+    // config-validity failure is reported by the caller's own check (qmd doctor prints
+    // "invalid index.yml at ...", qmd status reports it too). Throwing here would abort
+    // those commands before they could report the real problem - they resolve the
+    // embedding identity precisely so the report is accurate - turning a diagnosable
+    // YAML error into a bare non-zero exit. Falling back to the local identity is the
+    // same safe default as an untrusted project-local config.
+    return {};
+  }
 }
 
 export function resolveEmbedModelForCli(): string {
@@ -4196,7 +4213,15 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  // The embedding *identity* must be the remote-aware one: content_vectors.model and
+  // embed_fingerprint record the model that WROTE the vectors, so comparing them against
+  // the local URI (activeModels.embed, DEFAULT_EMBED_MODEL when nothing is configured)
+  // makes every stored vector look stale on a cloud-backed index — the permanent
+  // "0 docs current, N docs legacy/stale" plus a `--force` recommendation for a rebuild
+  // that is a no-op. It also mislabels the model in "N ... need embeddings".
+  // `activeModels` stays the LOCAL model set on purpose: the env-override, default and
+  // cache checks below are about local model files, which a remote backend does not replace.
+  const embedModel = resolveEmbedModelForCli();
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 
