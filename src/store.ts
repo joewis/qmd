@@ -100,10 +100,31 @@ const EMBED_FINGERPRINT_PROBE_QUERY = "__qmd_embedding_query_probe__";
 const EMBED_FINGERPRINT_PROBE_TITLE = "__qmd_embedding_title_probe__";
 const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
 
+/** Positive integer from the environment, else `fallback`. */
+function envChunkSetting(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
-export const CHUNK_SIZE_TOKENS = 900;
-export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 135 tokens (15% overlap)
+//
+// Overridable so chunk granularity is a deployment setting rather than a source constant.
+// It is an input to getEmbeddingFingerprint(), so changing it invalidates every stored
+// vector in the index - the whole index must move together, because a query is embedded
+// with the CURRENT settings and vector search matches on (model, embed_fingerprint). Any
+// mixed index would simply stop matching. Hence: one value per instance, set in that
+// instance's config (e.g. ~/.config/qmd/qmd.env), followed by a full re-embed.
+// Smaller chunks localise a passage better (900 -> ~45 lines/chunk, 300 -> ~14) at the
+// price of ~3x the vector rows; endpoint token volume is roughly unchanged, since overlap
+// is proportional to size.
+export const CHUNK_SIZE_TOKENS = envChunkSetting("QMD_CHUNK_SIZE_TOKENS", 900);
+export const CHUNK_OVERLAP_TOKENS = envChunkSetting(
+  "QMD_CHUNK_OVERLAP_TOKENS",
+  Math.floor(CHUNK_SIZE_TOKENS * 0.15),
+);  // 135 tokens (15% overlap) at the default size
 // Fallback char-based approximation for sync chunking (~4 chars per token)
 export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3600 chars
 export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
